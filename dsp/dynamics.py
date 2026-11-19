@@ -24,6 +24,23 @@ class DspError(ValueError):
     """Raised for invalid DSP parameters, sample rates, or sample data."""
 
 
+def _is_real_finite(value) -> bool:
+    """True for finite real numbers (rejects NaN, infinity, bools, non-numbers)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _check_samples(samples, name: str = "samples") -> None:
+    """Raise DspError unless every sample is a finite real number."""
+    for sample in samples:
+        if not _is_real_finite(sample):
+            raise DspError(f"non-finite value in {name}")
+
+
+def _check_rate(sample_rate) -> None:
+    if not _is_real_finite(sample_rate) or sample_rate <= 0:
+        raise DspError("sample_rate must be a positive finite number")
+
+
 def envelope(
     samples: list[float],
     attack_ms: float,
@@ -52,7 +69,31 @@ def envelope(
         DspError: if ``sample_rate <= 0``, a time constant is negative, or
             a sample is not finite.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    if not _is_real_finite(attack_ms) or attack_ms < 0:
+        raise DspError("attack_ms must be a non-negative finite number")
+    if not _is_real_finite(release_ms) or release_ms < 0:
+        raise DspError("release_ms must be a non-negative finite number")
+    _check_samples(samples)
+
+    attack_coeff = 0.0 if attack_ms == 0.0 else math.exp(
+        -1.0 / (attack_ms / 1000.0 * sample_rate)
+    )
+    release_coeff = 0.0 if release_ms == 0.0 else math.exp(
+        -1.0 / (release_ms / 1000.0 * sample_rate)
+    )
+
+    result = []
+    env = 0.0
+    for sample in samples:
+        target = abs(sample)
+        if target > env:
+            coeff = attack_coeff
+        else:
+            coeff = release_coeff
+        env = coeff * env + (1.0 - coeff) * target
+        result.append(env)
+    return result
 
 
 def gain_computer(
@@ -85,7 +126,35 @@ def gain_computer(
         DspError: for ``ratio < 1``, ``knee_db < 0``, non-finite input, or
             non-finite parameters.
     """
-    raise NotImplementedError
+    if not _is_real_finite(threshold_db) or not _is_real_finite(ratio):
+        raise DspError("threshold_db and ratio must be finite numbers")
+    if not _is_real_finite(knee_db) or not _is_real_finite(makeup_db):
+        raise DspError("knee_db and makeup_db must be finite numbers")
+    if ratio < 1.0:
+        raise DspError("ratio must be >= 1")
+    if knee_db < 0.0:
+        raise DspError("knee_db must be >= 0")
+    _check_samples(env_db, "env_db")
+
+    # ratio == 1 is a strict unity bypass: makeup is never applied.
+    if ratio == 1.0:
+        return [0.0 for _ in env_db]
+
+    half_knee = knee_db / 2.0
+    slope = 1.0 - 1.0 / ratio
+    result = []
+    for level_db in env_db:
+        x = level_db - threshold_db
+        if knee_db > 0.0 and -half_knee < x < half_knee:
+            gain = -(((x + half_knee) ** 2) / (2.0 * knee_db)) * slope
+        elif x >= half_knee:
+            gain = -x * slope
+        else:
+            gain = 0.0
+        if ratio > 1.0:
+            gain += makeup_db
+        result.append(gain)
+    return result
 
 
 def compress(
@@ -113,7 +182,26 @@ def compress(
         DspError: for invalid parameters, ``sample_rate <= 0``, or a
             non-finite sample.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    _check_samples(samples)
+
+    threshold_db = params["threshold_db"]
+    ratio = params["ratio"]
+    attack_ms = params["attack_ms"]
+    release_ms = params["release_ms"]
+    knee_db = params.get("knee_db", 0.0)
+    makeup_db = params.get("makeup_db", 0.0)
+
+    # Delegate parameter validation to the primitives.
+    env_linear = envelope(samples, attack_ms, release_ms, sample_rate)
+    env_db = [20.0 * math.log10(max(value, 1e-12)) for value in env_linear]
+    gains_db = gain_computer(env_db, threshold_db, ratio, knee_db, makeup_db)
+
+    output = []
+    for sample, gain_db in zip(samples, gains_db):
+        linear_gain = 10.0 ** (gain_db / 20.0)
+        output.append(sample * linear_gain)
+    return output
 
 
 def apply_limiter(
@@ -141,7 +229,36 @@ def apply_limiter(
         DspError: for ``lookahead_ms < 0``, ``sample_rate <= 0``,
             non-finite parameters, or a non-finite sample.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    if not _is_real_finite(ceiling_db):
+        raise DspError("ceiling_db must be a finite number")
+    if not _is_real_finite(lookahead_ms) or lookahead_ms < 0:
+        raise DspError("lookahead_ms must be a non-negative finite number")
+    _check_samples(samples)
+
+    ceiling = 10.0 ** (ceiling_db / 20.0)
+    delay = round(lookahead_ms / 1000.0 * sample_rate)
+    count = len(samples)
+    output = [0.0] * count
+
+    for n in range(count):
+        # The sample leaving the delay line, or silence before it starts.
+        source_index = n - delay
+        if source_index < 0:
+            continue
+        source = samples[source_index]
+        # Maximum absolute input in the D-sample look-ahead window,
+        # including the (delayed) current sample.
+        window_end = min(source_index + delay, count - 1)
+        window_peak = max(
+            abs(samples[i]) for i in range(source_index, window_end + 1)
+        )
+        if window_peak > ceiling:
+            gain = ceiling / window_peak
+        else:
+            gain = 1.0
+        output[n] = source * gain
+    return output
 
 
 def smoothed_gain(
@@ -166,7 +283,24 @@ def smoothed_gain(
         DspError: for ``time_ms < 0``, ``sample_rate <= 0``, or a
             non-finite gain.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    if not _is_real_finite(time_ms) or time_ms < 0:
+        raise DspError("time_ms must be a non-negative finite number")
+    _check_samples(gains, "gains")
+
+    if not gains:
+        return []
+
+    coeff = 0.0 if time_ms == 0.0 else math.exp(
+        -1.0 / (time_ms / 1000.0 * sample_rate)
+    )
+
+    result = [gains[0]]
+    previous = gains[0]
+    for gain in gains[1:]:
+        previous = coeff * previous + (1.0 - coeff) * gain
+        result.append(previous)
+    return result
 
 
 def biquad_coeffs(
@@ -194,7 +328,74 @@ def biquad_coeffs(
         DspError: for an unknown ``kind``, ``freq`` outside
             ``(0, sample_rate / 2)``, ``q <= 0``, or ``sample_rate <= 0``.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    if not _is_real_finite(freq) or not (0.0 < freq < sample_rate / 2.0):
+        raise DspError("freq must satisfy 0 < freq < sample_rate / 2")
+    if not _is_real_finite(q) or q <= 0:
+        raise DspError("q must be a positive finite number")
+    if not _is_real_finite(gain_db):
+        raise DspError("gain_db must be a finite number")
+
+    omega = 2.0 * math.pi * freq / sample_rate
+    cos_w = math.cos(omega)
+    sin_w = math.sin(omega)
+    alpha = sin_w / (2.0 * q)
+
+    if kind == "lowpass":
+        b0 = (1.0 - cos_w) / 2.0
+        b1 = 1.0 - cos_w
+        b2 = (1.0 - cos_w) / 2.0
+        a0 = 1.0 + alpha
+        a1 = -2.0 * cos_w
+        a2 = 1.0 - alpha
+    elif kind == "highpass":
+        b0 = (1.0 + cos_w) / 2.0
+        b1 = -(1.0 + cos_w)
+        b2 = (1.0 + cos_w) / 2.0
+        a0 = 1.0 + alpha
+        a1 = -2.0 * cos_w
+        a2 = 1.0 - alpha
+    elif kind == "peak":
+        amplitude = 10.0 ** (gain_db / 40.0)
+        b0 = 1.0 + alpha * amplitude
+        b1 = -2.0 * cos_w
+        b2 = 1.0 - alpha * amplitude
+        a0 = 1.0 + alpha / amplitude
+        a1 = -2.0 * cos_w
+        a2 = 1.0 - alpha / amplitude
+    elif kind == "lowshelf":
+        amplitude = 10.0 ** (gain_db / 40.0)
+        cosh_term = (amplitude + 1.0 / amplitude) * (1.0 / q - 1.0)
+        beta = 2.0 * math.sqrt(amplitude) * math.sqrt(
+            max(0.0, (cosh_term + 2.0) / 2.0)
+        )
+        amp_plus = amplitude + 1.0
+        amp_minus = amplitude - 1.0
+        b0 = amplitude * (amp_plus - amp_minus * cos_w + beta * sin_w)
+        b1 = 2.0 * amplitude * (amp_minus - amp_plus * cos_w)
+        b2 = amplitude * (amp_plus - amp_minus * cos_w - beta * sin_w)
+        a0 = amp_plus + amp_minus * cos_w + beta * sin_w
+        a1 = -2.0 * (amp_minus + amp_plus * cos_w)
+        a2 = amp_plus + amp_minus * cos_w - beta * sin_w
+    elif kind == "highshelf":
+        amplitude = 10.0 ** (gain_db / 40.0)
+        cosh_term = (amplitude + 1.0 / amplitude) * (1.0 / q - 1.0)
+        beta = 2.0 * math.sqrt(amplitude) * math.sqrt(
+            max(0.0, (cosh_term + 2.0) / 2.0)
+        )
+        amp_plus = amplitude + 1.0
+        amp_minus = amplitude - 1.0
+        b0 = amplitude * (amp_plus + amp_minus * cos_w + beta * sin_w)
+        b1 = -2.0 * amplitude * (amp_minus + amp_plus * cos_w)
+        b2 = amplitude * (amp_plus + amp_minus * cos_w - beta * sin_w)
+        a0 = amp_plus - amp_minus * cos_w + beta * sin_w
+        a1 = 2.0 * (amp_minus - amp_plus * cos_w)
+        a2 = amp_plus - amp_minus * cos_w - beta * sin_w
+    else:
+        raise DspError(f"unknown biquad kind: {kind!r}")
+
+    # Normalize every coefficient by a0 so the denominator's constant term is 1.
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
 
 
 def apply_biquad(samples: list[float], coeffs: tuple) -> list[float]:
@@ -220,7 +421,35 @@ def apply_biquad(samples: list[float], coeffs: tuple) -> list[float]:
     Raises:
         DspError: for malformed coefficient tuples or non-finite samples.
     """
-    raise NotImplementedError
+    # One independent state vector per coefficient tuple, so recomputing
+    # identical coefficients per block reuses the same filter instance while
+    # different filters (and different channels) never share state.
+    if not hasattr(apply_biquad, "_states"):
+        apply_biquad._states = {}
+    states = apply_biquad._states
+
+    if not isinstance(coeffs, tuple) or len(coeffs) != 5:
+        raise DspError("coeffs must be a (b0, b1, b2, a1, a2) tuple")
+    if not all(_is_real_finite(value) for value in coeffs):
+        raise DspError("coefficients must be finite numbers")
+    _check_samples(samples)
+
+    b0, b1, b2, a1, a2 = coeffs
+
+    # An empty block resets the stored state for these coefficients.
+    if not samples:
+        states.pop(coeffs, None)
+        return []
+
+    z1, z2 = states.get(coeffs, (0.0, 0.0))
+    result = []
+    for x in samples:
+        y = b0 * x + z1
+        z1 = b1 * x - a1 * y + z2
+        z2 = b2 * x - a2 * y
+        result.append(y)
+    states[coeffs] = (z1, z2)
+    return result
 
 
 def process_batch(
@@ -251,4 +480,16 @@ def process_batch(
         DspError: for any non-finite sample, invalid parameters, or
             ``sample_rate <= 0``.
     """
-    raise NotImplementedError
+    _check_rate(sample_rate)
+    if not isinstance(channels, list):
+        raise DspError("channels must be a list of sample lists")
+
+    # Validate every sample of every channel before any processing so the
+    # batch is rolled back atomically: no output and untouched inputs.
+    for channel in channels:
+        if not isinstance(channel, list):
+            raise DspError("every channel must be a sample list")
+        _check_samples(channel)
+
+    processed = [compress(channel, params, sample_rate) for channel in channels]
+    return {"channels": processed, "sample_rate": sample_rate}
